@@ -5,6 +5,17 @@
 Author: yaroxy
 Date: 2026-05-18
 Description: 
+
+workflow:
+
+加载环境变量 .env
+
+加载 .toml 配置
+
+--config /mnt/data/cpfs/yafengsun/workspace/chatops/config/chatops.opencode.toml 或者默认配置 config/chatops.opencode.toml
+
+
+
 """
 from __future__ import annotations
 
@@ -92,7 +103,7 @@ settings = load_opencode_settings()
 chat_locks: dict[str, Lock] = {}
 chat_locks_guard = Lock()
 state_lock = Lock()
-running_tasks: dict[str, subprocess.Popen[str]] = {}
+running_tasks: dict[str, list[subprocess.Popen[str]]] = {}
 NO_OPENCODE_OUTPUT = "opencode completed, but returned no output."
 
 
@@ -298,16 +309,32 @@ def extract_json_run_result(stdout: str) -> tuple[str, str | None]:
     return "\n".join(texts).strip(), session_id
 
 
-def run_opencode_command(cmd: list[str], env: dict[str, str]) -> tuple[int, str, str]:
+def run_opencode_command(
+    cmd: list[str],
+    env: dict[str, str],
+    process_holder: list[subprocess.Popen[str]] | None = None,
+) -> tuple[int, str, str]:
     process = subprocess.Popen(
         cmd,
         text=True,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
     )
-    stdout, stderr = process.communicate(timeout=settings.task_timeout_seconds)
-    return process.returncode or 0, stdout, stderr
+    if process_holder is not None:
+        process_holder.append(process)
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=settings.task_timeout_seconds)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            stdout, stderr = process.communicate()
+            raise
+        return process.returncode or 0, stdout, stderr
+    finally:
+        if process_holder is not None:
+            process_holder.clear()
 
 
 def run_opencode_task_and_reply(
@@ -328,156 +355,73 @@ def run_opencode_task_and_reply(
         title = f"chatops {task_id}: {prompt[:64]}"
 
         cmd = [
-            "opencode",
-            "run",
-            "--attach",
-            settings.server_url,
-            "--dir",
-            str(workspace_dir),
-            "--agent",
-            agent,
-            "--title",
-            title,
+            "opencode", "run",
+            "--dir", str(workspace_dir),
+            "--agent", agent,
+            "--title", title,
+            "--format", "json",
         ]
+        child_env = os.environ.copy()
+        child_env.pop(settings.username_env, None)
+        child_env.pop(settings.password_env, None)
+
         if model:
             cmd.extend(["--model", model])
         if session_id:
             cmd.extend(["--session", session_id])
         cmd.append(prompt)
 
-        child_env = os.environ.copy()
-        username = os.environ.get(settings.username_env)
-        password = os.environ.get(settings.password_env)
-        if username:
-            child_env["OPENCODE_SERVER_USERNAME"] = username
-        if password:
-            child_env["OPENCODE_SERVER_PASSWORD"] = password
-
         print(f"run_opencode_task_and_reply: task_id={task_id}, agent={agent}, workspace={workspace_name}")
-        process = subprocess.Popen(
-            cmd,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=child_env,
-        )
-        running_tasks[chat_id] = process
-        stdout, stderr = process.communicate(timeout=settings.task_timeout_seconds)
-        returncode = process.returncode or 0
+        process_holder: list[subprocess.Popen[str]] = []
+        running_tasks[chat_id] = process_holder
+        returncode, stdout, stderr = run_opencode_command(cmd, child_env, process_holder)
 
-        if returncode == 0:
-            output = summarize_output(stdout)
-            if output == NO_OPENCODE_OUTPUT and session_id:
-                try:
-                    output = extract_latest_assistant_text(opencode_client.session_messages(session_id)) or output
-                except Exception:
-                    print("failed to fetch opencode assistant output by session_id:")
-                    print(traceback.format_exc())
-            if output == NO_OPENCODE_OUTPUT:
-                latest_session = None
-                try:
-                    latest_session = opencode_client.find_session(workspace_dir, agent, title)
-                    if latest_session:
-                        update_chat_state(chat_id, session_id=latest_session)
-                        output = extract_latest_assistant_text(opencode_client.session_messages(latest_session)) or output
-                except Exception:
-                    print("failed to fetch opencode assistant output by title:")
-                    print(traceback.format_exc())
-            if output == NO_OPENCODE_OUTPUT:
-                local_cmd: list[str] = []
-                skip_next = False
-                for item in cmd:
-                    if item in {"--attach"}:
-                        skip_next = True
-                        continue
-                    if skip_next:
-                        skip_next = False
-                        continue
-                    local_cmd.append(item)
-                local_cmd.insert(2, "--format")
-                local_cmd.insert(3, "json")
-                local_env = child_env.copy()
-                local_env.pop("OPENCODE_SERVER_USERNAME", None)
-                local_env.pop("OPENCODE_SERVER_PASSWORD", None)
-                print(f"retrying opencode task locally: task_id={task_id}, agent={agent}, workspace={workspace_name}")
-                returncode, stdout, stderr = run_opencode_command(local_cmd, local_env)
-                if returncode != 0 and "Session not found" in stderr and session_id:
-                    print(f"session not found locally, retrying without session: task_id={task_id}")
-                    no_session_cmd = []
-                    skip_next = False
-                    for item in local_cmd:
-                        if item == "--session":
-                            skip_next = True
-                            continue
-                        if skip_next:
-                            skip_next = False
-                            continue
-                        no_session_cmd.append(item)
-                    returncode, stdout, stderr = run_opencode_command(no_session_cmd, local_env)
-                if returncode == 0:
-                    parsed_output, parsed_session_id = extract_json_run_result(stdout)
-                    if parsed_output:
-                        if parsed_session_id:
-                            update_chat_state(chat_id, session_id=parsed_session_id)
-                        output = parsed_output or summarize_output(stdout)
-                    elif session_id:
-                        print(f"local retry produced no text with session, retrying without: task_id={task_id}")
-                        no_session_cmd = []
-                        skip_next = False
-                        for item in local_cmd:
-                            if item == "--session":
-                                skip_next = True
-                                continue
-                            if skip_next:
-                                skip_next = False
-                                continue
-                            no_session_cmd.append(item)
-                        returncode, stdout, stderr = run_opencode_command(no_session_cmd, local_env)
-                        if returncode == 0:
-                            parsed_output, parsed_session_id = extract_json_run_result(stdout)
-                            if parsed_session_id:
-                                update_chat_state(chat_id, session_id=parsed_session_id)
-                            output = parsed_output or summarize_output(stdout)
-                        else:
-                            text = (
-                                f"Task {task_id} failed with exit code {returncode}.\n\n"
-                                f"stderr:\n{stderr[-3000:]}"
-                            )
-                            send_text_response(message, text)
-                            return
-                    else:
-                        output = parsed_output or summarize_output(stdout)
-                else:
-                    text = (
-                        f"Task {task_id} failed with exit code {returncode}.\n\n"
-                        f"stderr:\n{stderr[-3000:]}"
-                    )
-                    send_text_response(message, text)
-                    return
-            text = f"Task {task_id} completed ({workspace_name}/{agent}):\n\n{output}"
-        elif returncode == -15:
-            text = f"Task {task_id} was aborted."
-        else:
+        if returncode != 0:
             text = (
-                f"Task {task_id} failed with exit code {returncode}.\n\n"
-                f"stderr:\n{stderr[-3000:]}"
+                f"Task {task_id} failed (exit code {returncode}).\n\n"
+                f"stderr:\n{stderr[-3000:]}" if stderr else ""
             )
+            send_text_response(message, text)
+            return
+
+        _, stdout_session_id = extract_json_run_result(stdout)
+        active_session_id = stdout_session_id or session_id
+        if stdout_session_id:
+            update_chat_state(chat_id, session_id=stdout_session_id)
+
+        output = NO_OPENCODE_OUTPUT
+
+        if active_session_id:
+            try:
+                messages = opencode_client.session_messages(active_session_id)
+                output = extract_latest_assistant_text(messages)
+            except Exception:
+                print("failed to fetch session messages from opencode server")
+                print(traceback.format_exc())
+
+        if output == NO_OPENCODE_OUTPUT:
+            output = summarize_output(stdout)
+
+        if output == NO_OPENCODE_OUTPUT:
+            text = f"Task {task_id} completed ({workspace_name}/{agent}), but no output was produced."
+            if stderr:
+                text += f"\n\nstderr:\n{stderr[-2000:]}"
+            text += f"\n\nstdout ({len(stdout)} chars):\n{stdout[-3000:]}" if stdout else ""
+        else:
+            text = f"Task {task_id} completed ({workspace_name}/{agent}):\n\n{output}"
+        send_text_response(message, text)
 
     except subprocess.TimeoutExpired:
-        process = running_tasks.get(chat_id)
-        if process:
-            process.terminate()
-        text = f"Task {task_id} timed out."
-
+        send_text_response(message, f"Task {task_id} timed out.")
     except Exception:
-        text = f"Task {task_id} raised an exception:\n\n{traceback.format_exc()[-3000:]}"
-
+        send_text_response(
+            message,
+            f"Task {task_id} raised an exception:\n\n{traceback.format_exc()[-3000:]}",
+        )
     finally:
         running_tasks.pop(chat_id, None)
         update_chat_state(chat_id, active_task=None)
         lock.release()
-
-    send_text_response(message, text)
 
 
 def handle_command(message: EventMessage, text: str) -> str:
@@ -569,10 +513,14 @@ def handle_command(message: EventMessage, text: str) -> str:
         return f"Accepted {cmd} task. Task ID: {task_id}\nI will send the result back to this chat when it completes."
 
     if cmd == "/abort":
-        process = running_tasks.get(chat_id)
-        if not process:
+        procs = running_tasks.get(chat_id)
+        if not procs:
             return "This chat has no running task."
-        process.terminate()
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
         return "Abort request sent."
 
     return "Unknown command. Send /help or /command to see supported commands."

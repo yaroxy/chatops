@@ -23,3 +23,6 @@ references
 
 # config
 config/**/*.toml
+
+# outputs
+outputs
