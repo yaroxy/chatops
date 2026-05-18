@@ -20,3 +20,6 @@ dev-docs
 
 # references
 references
+
+# config
+config/**/*.toml

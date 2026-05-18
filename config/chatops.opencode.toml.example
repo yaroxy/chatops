@@ -9,7 +9,7 @@ state_path = ".chatops/opencode-state.json"
 task_timeout_seconds = 1800
 
 [opencode.workspaces.test-chatops]
-path = "/Users/roxy/Documents/workspace/test-chatops"
+path = "/mnt/data/cpfs/yafengsun/test-chatops"
 
-[opencode.workspaces.chatops]
-path = "/Users/roxy/Documents/workspace/chatops"
+[opencode.workspaces.llm-memory]
+path = "/mnt/data/cpfs/yafengsun/workspace/llm-memory"
