@@ -18,9 +18,16 @@ import subprocess
 import textwrap
 import traceback
 import uuid
+import tomllib
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from threading import Lock
 from lark_oapi.api.im.v1 import *
+from typing import Any
+from urllib import request
+from urllib.error import HTTPError, URLError
 
 executor = ThreadPoolExecutor(max_workers=4)
 
@@ -35,91 +42,540 @@ lark.APP_SECRET = APP_SECRET
 # ==============================================================================
 # for opencode
 # ==============================================================================
-help_text = textwrap.dedent("""支持的命令：
-/list-workspace 或 /ls
-/change-workspace <name> 或 /cw <name>
-/plan <task>
+WORKSPACE_ROOT = Path(__file__).resolve().parents[4]
+CONFIG_PATH = Path(os.environ.get("CHATOPS_OPENCODE_CONFIG", WORKSPACE_ROOT / "config/chatops.opencode.toml"))
+
+
+@dataclass(frozen=True)
+class OpenCodeSettings:
+    server_url: str
+    username_env: str
+    password_env: str
+    default_workspace: str
+    default_agent: str
+    default_model: str
+    state_path: Path
+    task_timeout_seconds: int
+    workspaces: dict[str, Path]
+
+
+def load_opencode_settings() -> OpenCodeSettings:
+    with CONFIG_PATH.open("rb") as f:
+        raw = tomllib.load(f)
+
+    opencode = raw["opencode"]
+    workspaces = {
+        name: Path(item["path"]).expanduser()
+        for name, item in opencode.get("workspaces", {}).items()
+    }
+    default_workspace = opencode["default_workspace"]
+    if default_workspace not in workspaces:
+        raise ValueError(f"default_workspace is not configured: {default_workspace}")
+    state_path = Path(opencode.get("state_path", ".chatops/opencode-state.json"))
+    if not state_path.is_absolute():
+        state_path = WORKSPACE_ROOT / state_path
+
+    return OpenCodeSettings(
+        server_url=opencode.get("server_url", "http://127.0.0.1:4096").rstrip("/"),
+        username_env=opencode.get("username_env", "OPENCODE_SERVER_USERNAME"),
+        password_env=opencode.get("password_env", "OPENCODE_SERVER_PASSWORD"),
+        default_workspace=default_workspace,
+        default_agent=opencode.get("default_agent", "plan"),
+        default_model=opencode.get("default_model", ""),
+        state_path=state_path,
+        task_timeout_seconds=int(opencode.get("task_timeout_seconds", 1800)),
+        workspaces=workspaces,
+    )
+
+
+settings = load_opencode_settings()
+chat_locks: dict[str, Lock] = {}
+chat_locks_guard = Lock()
+state_lock = Lock()
+running_tasks: dict[str, subprocess.Popen[str]] = {}
+NO_OPENCODE_OUTPUT = "opencode completed, but returned no output."
+
+
+help_text = textwrap.dedent("""Supported commands:
+/help or /command: Show commands
+/health: Check the opencode server
+/list-workspace or /ls: List allowed workspaces
+/change-workspace <name> or /cw <name>: Switch workspace
+/session: Show current chat state
+/new-session or /ns: Clear the stored session (next request starts fresh)
+/model: Show the current model and connected providers
+/model <provider/model>: Switch model
+/plan <task>: Run the opencode plan agent
+/build <task>: Run the opencode build agent
+/abort: Abort the current opencode task in this chat
 """)
 
-def run_opencode_plan_and_reply(
+
+class OpenCodeClient:
+    def __init__(self, cfg: OpenCodeSettings):
+        self.cfg = cfg
+
+    def get_json(self, path: str) -> Any:
+        req = request.Request(f"{self.cfg.server_url}{path}")
+        username = os.environ.get(self.cfg.username_env)
+        password = os.environ.get(self.cfg.password_env)
+        if username and password:
+            import base64
+
+            token = base64.b64encode(f"{username}:{password}".encode()).decode()
+            req.add_header("Authorization", f"Basic {token}")
+
+        with request.urlopen(req, timeout=10) as response:
+            data = response.read().decode("utf-8")
+            return json.loads(data) if data else None
+
+    def health(self) -> dict[str, Any]:
+        return self.get_json("/global/health")
+
+    def providers(self) -> dict[str, Any]:
+        return self.get_json("/provider")
+
+    def sessions(self) -> list[dict[str, Any]]:
+        return self.get_json("/session")
+
+    def session_messages(self, session_id: str) -> list[dict[str, Any]]:
+        return self.get_json(f"/session/{session_id}/message")
+
+    def find_session(self, workspace_dir: Path, agent: str, title: str) -> str | None:
+        workspace = str(workspace_dir)
+        matches = [
+            item
+            for item in self.sessions()
+            if item.get("directory") == workspace
+            and item.get("agent") == agent
+            and item.get("title") == title
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda item: item.get("time", {}).get("updated", 0), reverse=True)
+        return matches[0].get("id")
+
+
+opencode_client = OpenCodeClient(settings)
+
+
+def state_key(message: EventMessage) -> str:
+    return message.chat_id
+
+
+def get_chat_lock(chat_id: str) -> Lock:
+    with chat_locks_guard:
+        if chat_id not in chat_locks:
+            chat_locks[chat_id] = Lock()
+        return chat_locks[chat_id]
+
+
+def load_state() -> dict[str, Any]:
+    if not settings.state_path.exists():
+        return {}
+    try:
+        return json.loads(settings.state_path.read_text(encoding="utf-8"))
+    except Exception:
+        print(f"failed to load state: {settings.state_path}")
+        print(traceback.format_exc())
+        return {}
+
+
+def save_state(state: dict[str, Any]) -> None:
+    settings.state_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_chat_state(chat_id: str) -> dict[str, Any]:
+    with state_lock:
+        state = load_state()
+        chat_state = state.setdefault(chat_id, {})
+        chat_state.setdefault("workspace", settings.default_workspace)
+        if chat_state["workspace"] not in settings.workspaces:
+            chat_state["workspace"] = settings.default_workspace
+        chat_state.setdefault("model", settings.default_model)
+        chat_state.setdefault("session_id", None)
+        chat_state.setdefault("active_task", None)
+        save_state(state)
+        return dict(chat_state)
+
+
+def update_chat_state(chat_id: str, **updates: Any) -> dict[str, Any]:
+    with state_lock:
+        state = load_state()
+        chat_state = state.setdefault(chat_id, {})
+        chat_state.setdefault("workspace", settings.default_workspace)
+        if chat_state["workspace"] not in settings.workspaces:
+            chat_state["workspace"] = settings.default_workspace
+        chat_state.setdefault("model", settings.default_model)
+        chat_state.setdefault("session_id", None)
+        chat_state.update(updates)
+        save_state(state)
+        return dict(chat_state)
+
+
+def command_parts(text: str) -> tuple[str, str]:
+    cmd, _, arg = text.strip().partition(" ")
+    return cmd, arg.strip()
+
+
+def summarize_output(stdout: str) -> str:
+    output = stdout.strip()
+    if not output:
+        return NO_OPENCODE_OUTPUT
+    parsed_output, _ = extract_json_run_result(output)
+    if parsed_output:
+        return parsed_output
+    if is_json_event_stream(output):
+        return NO_OPENCODE_OUTPUT
+    output = clean_assistant_text(output)
+    if not output:
+        return NO_OPENCODE_OUTPUT
+    if len(output) > 3500:
+        return output[-3500:]
+    return output
+
+
+def clean_assistant_text(text: str) -> str:
+    text = text.strip()
+    while True:
+        start = text.find("<system-reminder>")
+        if start == -1:
+            break
+        end = text.find("</system-reminder>", start)
+        if end == -1:
+            text = text[:start]
+            break
+        text = text[:start] + text[end + len("</system-reminder>"):]
+    return text.strip()
+
+
+def is_json_event_stream(stdout: str) -> bool:
+    saw_json = False
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        saw_json = True
+    return saw_json
+
+
+def extract_latest_assistant_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        info = message.get("info", {})
+        if info.get("role") != "assistant":
+            continue
+        texts = [
+            clean_assistant_text(part.get("text", ""))
+            for part in message.get("parts", [])
+            if part.get("type") == "text" and clean_assistant_text(part.get("text", ""))
+        ]
+        if texts:
+            return "\n".join(texts).strip()
+    return ""
+
+
+def extract_json_run_result(stdout: str) -> tuple[str, str | None]:
+    texts: list[str] = []
+    session_id = None
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        session_id = event.get("sessionID") or session_id
+        part = event.get("part", {})
+        if part.get("type") == "text" and part.get("text"):
+            text = clean_assistant_text(part["text"])
+            if text:
+                texts.append(text)
+            session_id = part.get("sessionID") or session_id
+    return "\n".join(texts).strip(), session_id
+
+
+def run_opencode_command(cmd: list[str], env: dict[str, str]) -> tuple[int, str, str]:
+    process = subprocess.Popen(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    stdout, stderr = process.communicate(timeout=settings.task_timeout_seconds)
+    return process.returncode or 0, stdout, stderr
+
+
+def run_opencode_task_and_reply(
     message: EventMessage,
     prompt: str,
+    agent: str,
     task_id: str,
 ) -> None:
-    # debug
-    print(f"run_opencode_plan_and_reply: prompt={prompt}, task_id={task_id}")
+    chat_id = state_key(message)
+    lock = get_chat_lock(chat_id)
+
     try:
-        workspace_dir = "/Users/roxy/Documents/workspace/test-chatops"
+        chat_state = get_chat_state(chat_id)
+        workspace_name = chat_state["workspace"]
+        workspace_dir = settings.workspaces[workspace_name]
+        model = chat_state.get("model") or settings.default_model
+        session_id = chat_state.get("session_id")
+        title = f"chatops {task_id}: {prompt[:64]}"
 
         cmd = [
             "opencode",
             "run",
+            "--attach",
+            settings.server_url,
             "--dir",
-            workspace_dir,
+            str(workspace_dir),
             "--agent",
-            "plan",
-            prompt,
+            agent,
+            "--title",
+            title,
         ]
+        if model:
+            cmd.extend(["--model", model])
+        if session_id:
+            cmd.extend(["--session", session_id])
+        cmd.append(prompt)
 
-        completed = subprocess.run(
+        child_env = os.environ.copy()
+        username = os.environ.get(settings.username_env)
+        password = os.environ.get(settings.password_env)
+        if username:
+            child_env["OPENCODE_SERVER_USERNAME"] = username
+        if password:
+            child_env["OPENCODE_SERVER_PASSWORD"] = password
+
+        print(f"run_opencode_task_and_reply: task_id={task_id}, agent={agent}, workspace={workspace_name}")
+        process = subprocess.Popen(
             cmd,
             text=True,
-            capture_output=True,
-            timeout=600,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_env,
         )
-        # debug
-        print(f"run_opencode_plan_and_reply: completed={completed}")
+        running_tasks[chat_id] = process
+        stdout, stderr = process.communicate(timeout=settings.task_timeout_seconds)
+        returncode = process.returncode or 0
 
-        if completed.returncode == 0:
-            output = completed.stdout.strip()
-            if not output:
-                output = "opencode 执行完成，但没有输出。"
-
-            text = f"任务 {task_id} 执行完成：\n\n{output}"
+        if returncode == 0:
+            output = summarize_output(stdout)
+            if output == NO_OPENCODE_OUTPUT and session_id:
+                try:
+                    output = extract_latest_assistant_text(opencode_client.session_messages(session_id)) or output
+                except Exception:
+                    print("failed to fetch opencode assistant output by session_id:")
+                    print(traceback.format_exc())
+            if output == NO_OPENCODE_OUTPUT:
+                latest_session = None
+                try:
+                    latest_session = opencode_client.find_session(workspace_dir, agent, title)
+                    if latest_session:
+                        update_chat_state(chat_id, session_id=latest_session)
+                        output = extract_latest_assistant_text(opencode_client.session_messages(latest_session)) or output
+                except Exception:
+                    print("failed to fetch opencode assistant output by title:")
+                    print(traceback.format_exc())
+            if output == NO_OPENCODE_OUTPUT:
+                local_cmd: list[str] = []
+                skip_next = False
+                for item in cmd:
+                    if item in {"--attach"}:
+                        skip_next = True
+                        continue
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    local_cmd.append(item)
+                local_cmd.insert(2, "--format")
+                local_cmd.insert(3, "json")
+                local_env = child_env.copy()
+                local_env.pop("OPENCODE_SERVER_USERNAME", None)
+                local_env.pop("OPENCODE_SERVER_PASSWORD", None)
+                print(f"retrying opencode task locally: task_id={task_id}, agent={agent}, workspace={workspace_name}")
+                returncode, stdout, stderr = run_opencode_command(local_cmd, local_env)
+                if returncode != 0 and "Session not found" in stderr and session_id:
+                    print(f"session not found locally, retrying without session: task_id={task_id}")
+                    no_session_cmd = []
+                    skip_next = False
+                    for item in local_cmd:
+                        if item == "--session":
+                            skip_next = True
+                            continue
+                        if skip_next:
+                            skip_next = False
+                            continue
+                        no_session_cmd.append(item)
+                    returncode, stdout, stderr = run_opencode_command(no_session_cmd, local_env)
+                if returncode == 0:
+                    parsed_output, parsed_session_id = extract_json_run_result(stdout)
+                    if parsed_output:
+                        if parsed_session_id:
+                            update_chat_state(chat_id, session_id=parsed_session_id)
+                        output = parsed_output or summarize_output(stdout)
+                    elif session_id:
+                        print(f"local retry produced no text with session, retrying without: task_id={task_id}")
+                        no_session_cmd = []
+                        skip_next = False
+                        for item in local_cmd:
+                            if item == "--session":
+                                skip_next = True
+                                continue
+                            if skip_next:
+                                skip_next = False
+                                continue
+                            no_session_cmd.append(item)
+                        returncode, stdout, stderr = run_opencode_command(no_session_cmd, local_env)
+                        if returncode == 0:
+                            parsed_output, parsed_session_id = extract_json_run_result(stdout)
+                            if parsed_session_id:
+                                update_chat_state(chat_id, session_id=parsed_session_id)
+                            output = parsed_output or summarize_output(stdout)
+                        else:
+                            text = (
+                                f"Task {task_id} failed with exit code {returncode}.\n\n"
+                                f"stderr:\n{stderr[-3000:]}"
+                            )
+                            send_text_response(message, text)
+                            return
+                    else:
+                        output = parsed_output or summarize_output(stdout)
+                else:
+                    text = (
+                        f"Task {task_id} failed with exit code {returncode}.\n\n"
+                        f"stderr:\n{stderr[-3000:]}"
+                    )
+                    send_text_response(message, text)
+                    return
+            text = f"Task {task_id} completed ({workspace_name}/{agent}):\n\n{output}"
+        elif returncode == -15:
+            text = f"Task {task_id} was aborted."
         else:
             text = (
-                f"任务 {task_id} 执行失败，退出码：{completed.returncode}\n\n"
-                f"stderr:\n{completed.stderr[-3000:]}"
+                f"Task {task_id} failed with exit code {returncode}.\n\n"
+                f"stderr:\n{stderr[-3000:]}"
             )
 
     except subprocess.TimeoutExpired:
-        text = f"任务 {task_id} 执行超时。"
+        process = running_tasks.get(chat_id)
+        if process:
+            process.terminate()
+        text = f"Task {task_id} timed out."
 
     except Exception:
-        text = f"任务 {task_id} 执行异常：\n\n{traceback.format_exc()[-3000:]}"
+        text = f"Task {task_id} raised an exception:\n\n{traceback.format_exc()[-3000:]}"
+
+    finally:
+        running_tasks.pop(chat_id, None)
+        update_chat_state(chat_id, active_task=None)
+        lock.release()
 
     send_text_response(message, text)
 
+
 def handle_command(message: EventMessage, text: str) -> str:
     text = text.strip()
+    chat_id = state_key(message)
+    cmd, arg = command_parts(text)
 
-    if text.startswith("/help") or text.startswith("/command"):
+    if cmd in {"/help", "/command"}:
         return help_text
 
-    if text.startswith("/list-workspace") or text.startswith("/ls"):
-        return "TODO: 返回 workspace 列表"
+    if cmd == "/health":
+        try:
+            health = opencode_client.health()
+            return f"opencode server is healthy: version={health.get('version')}"
+        except (HTTPError, URLError, TimeoutError) as exc:
+            return f"opencode server is unavailable: {exc}"
 
-    if text.startswith("/change-workspace") or text.startswith("/cw"):
-        return "TODO: 切换 workspace"
+    if cmd in {"/list-workspace", "/ls"}:
+        current = get_chat_state(chat_id)["workspace"]
+        lines = ["Allowed workspaces:"]
+        for name, path in settings.workspaces.items():
+            mark = "*" if name == current else " "
+            lines.append(f"{mark} {name}: {path}")
+        return "\n".join(lines)
 
-    if text.startswith("/plan"):
-        prompt = text.removeprefix("/plan").strip()
+    if cmd in {"/change-workspace", "/cw"}:
+        if not arg:
+            return "Usage: /cw <workspace>"
+        if arg not in settings.workspaces:
+            return f"Unknown workspace: {arg}\nSend /ls to see the allowed list."
+        if running_tasks.get(chat_id):
+            return "This chat has a running task. Wait for it to finish or send /abort before switching workspace."
+        update_chat_state(chat_id, workspace=arg, session_id=None, active_task=None)
+        return f"Switched workspace: {arg}"
+
+    if cmd == "/session":
+        chat_state = get_chat_state(chat_id)
+        busy = "yes" if running_tasks.get(chat_id) else "no"
+        return "\n".join(
+            [
+                "Current state:",
+                f"workspace: {chat_state['workspace']}",
+                f"model: {chat_state.get('model') or settings.default_model}",
+                f"busy: {busy}",
+                f"session_id: {chat_state.get('session_id') or 'none'}",
+            ]
+        )
+
+    if cmd in {"/new-session", "/ns"}:
+        update_chat_state(chat_id, session_id=None)
+        return "Cleared the session. The next request will create a new session."
+
+    if cmd == "/model":
+        if not arg:
+            try:
+                providers = opencode_client.providers()
+                connected = ", ".join(providers.get("connected", [])) or "none"
+            except Exception:
+                connected = "failed to fetch"
+            chat_state = get_chat_state(chat_id)
+            return f"Current model: {chat_state.get('model') or settings.default_model}\nConnected providers: {connected}\nUsage: /model <provider/model>"
+        if running_tasks.get(chat_id):
+            return "This chat has a running task. Wait for it to finish or send /abort before switching model."
+        update_chat_state(chat_id, model=arg)
+        return f"Switched model: {arg}"
+
+    if cmd in {"/plan", "/build"}:
+        prompt = arg
         if not prompt:
-            return "用法：/plan <task>"
+            return f"Usage: {cmd} <task>"
+
+        lock = get_chat_lock(chat_id)
+        if not lock.acquire(blocking=False):
+            return "This chat has a running opencode task. Wait for it to finish or send /abort."
 
         task_id = uuid.uuid4().hex[:8]
+        agent = cmd.removeprefix("/")
+        update_chat_state(chat_id, active_task={"id": task_id, "agent": agent})
 
         future = executor.submit(
-            run_opencode_plan_and_reply,
+            run_opencode_task_and_reply,
             message,
             prompt,
+            agent,
             task_id,
         )
         future.add_done_callback(log_future_exception)
 
-        return f"已收到 /plan 任务，任务 ID：{task_id}\n我会在执行完成后把结果发到当前会话。"
+        return f"Accepted {cmd} task. Task ID: {task_id}\nI will send the result back to this chat when it completes."
 
-    return "未识别命令。发送 /help 或 /command 查看支持的命令。"
+    if cmd == "/abort":
+        process = running_tasks.get(chat_id)
+        if not process:
+            return "This chat has no running task."
+        process.terminate()
+        return "Abort request sent."
+
+    return "Unknown command. Send /help or /command to see supported commands."
 
 
 def log_future_exception(future):
@@ -130,7 +586,7 @@ def log_future_exception(future):
         print(traceback.format_exc())
 
 # ==============================================================================
-# 回调函数
+# callbacks
 # ==============================================================================
 def send_text_response(message: EventMessage, text: str) -> None:
     payload = json.dumps({"text": text}, ensure_ascii=False)
@@ -149,7 +605,6 @@ def send_text_response(message: EventMessage, text: str) -> None:
             .build()
         )
 
-        # 使用OpenAPI发送消息
         # Use send OpenAPI to send messages
         # https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/create
         response = client.im.v1.message.create(request)
@@ -172,7 +627,6 @@ def send_text_response(message: EventMessage, text: str) -> None:
             .build()
         )
 
-        # 使用OpenAPI回复消息
         # Reply to messages using send OpenAPI
         # https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/reply
         response = client.im.v1.message.reply(request)
@@ -183,14 +637,13 @@ def send_text_response(message: EventMessage, text: str) -> None:
                 f"log_id={response.get_log_id()}"
             )
 
-# 注册接收消息事件，处理接收到的消息。
 # Register event handler to handle received messages.
 # https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/events/receive
 def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
     message = data.event.message
 
     if message.message_type != "text":
-        send_text_response(message, "暂时只支持文本消息。")
+        send_text_response(message, "Only text messages are supported for now.")
         return
 
     try:
@@ -203,18 +656,21 @@ def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
     send_text_response(message, result)
 
 
+def do_p2_im_message_message_read_v1(data: P2ImMessageMessageReadV1) -> None:
+    return
+
+
 # ==============================================================================
 # SECTION TITLE: MESSAGER.PY
 # ==============================================================================
-# 注册事件回调
 # Register event handler.
 event_handler = (
     lark.EventDispatcherHandler.builder("", "")
     .register_p2_im_message_receive_v1(do_p2_im_message_receive_v1)
+    .register_p2_im_message_message_read_v1(do_p2_im_message_message_read_v1)
     .build()
 )
 
-# 创建 LarkClient 对象，用于请求OpenAPI, 并创建 LarkWSClient 对象，用于使用长连接接收事件。
 # Create LarkClient object for requesting OpenAPI, and create LarkWSClient object for receiving events using long connection.
 client = lark.Client.builder().app_id(lark.APP_ID).app_secret(lark.APP_SECRET).build()
 wsClient = lark.ws.Client(
@@ -225,7 +681,6 @@ wsClient = lark.ws.Client(
 )
 
 def main() -> None:
-    #  启动长连接，并注册事件处理器。
     #  Start long connection and register event handler.
     wsClient.start()
 

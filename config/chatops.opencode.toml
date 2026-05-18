@@ -1,0 +1,15 @@
+[opencode]
+server_url = "http://127.0.0.1:4096"
+username_env = "OPENCODE_SERVER_USERNAME"
+password_env = "OPENCODE_SERVER_PASSWORD"
+default_workspace = "test-chatops"
+default_agent = "plan"
+default_model = "deepseek/deepseek-v4-pro"
+state_path = ".chatops/opencode-state.json"
+task_timeout_seconds = 1800
+
+[opencode.workspaces.test-chatops]
+path = "/Users/roxy/Documents/workspace/test-chatops"
+
+[opencode.workspaces.chatops]
+path = "/Users/roxy/Documents/workspace/chatops"
