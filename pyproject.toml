@@ -7,7 +7,10 @@ authors = [
     { name = "yaroxy", email = "yaroxywithyou@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "fastapi[standard]>=0.136.1",
+    "lark-oapi>=1.6.5",
+]
 
 [project.scripts]
 chatops = "chatops:main"
