@@ -45,7 +45,7 @@ OPENCODE_SERVER_USERNAME: str = os.environ.get("OPENCODE_SERVER_USERNAME", "yaro
 OPENCODE_PORT: int = int(os.environ.get("OPENCODE_PORT", "8192"))
 OPENCODE_HOSTNAME: str = os.environ.get("OPENCODE_HOSTNAME", "127.0.0.1")
 OUTPUTS_DIR: str = os.environ.get("OUTPUTS_DIR", f"{os.getcwd()}/outputs")
-CONFIG_PATH: str = os.environ.get("CHATOPS_CONFIG", "tests/test.toml")
+CONFIG_PATH: str = os.environ.get("CHATOPS_CONFIG", "config/chatops.opencode.toml")
 
 LARK_APP_ID = os.environ.get("LARK_APP_ID")
 LARK_APP_SECRET = os.environ.get("LARK_APP_SECRET")
@@ -151,6 +151,17 @@ class WorkspaceConfig(BaseModel):
 
         return value
 
+class AuthConfig(BaseModel):
+    # allowed_chat_ids: set[str] = Field(default_factory=set)
+    allowed_open_ids: set[str] = Field(default_factory=set)
+    # admin_open_ids: set[str] = Field(default_factory=set)
+
+    @model_validator(mode="after")
+    def validate_auth(self) -> AuthConfig:
+        if not self.allowed_open_ids:
+            raise ValueError("allowed_open_ids is required")
+
+        return self
 
 class ChatOpsConfig(BaseModel):
     """
@@ -184,8 +195,10 @@ class ChatOpsConfig(BaseModel):
 
     workspaces: dict[str, WorkspaceConfig] = Field(default_factory=dict)
 
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+
     @model_validator(mode="after")
-    def validate_workspace(self) -> "ChatOpsConfig":
+    def validate_workspace(self) -> ChatOpsConfig:
         if self.workspace not in self.workspaces:
             available = ", ".join(self.workspaces.keys())
             raise ValueError(
@@ -853,9 +866,13 @@ def claim_message(message_id: str | None) -> bool:
 class LarkBot:
     def __init__(
         self,
+        config: AppConfig,
         backend: OpenCodeAgentBackend,
     ) -> None:
+        self.config = config
         self.backend = backend
+
+        self.auth = self.config.chatops.auth
 
         self.client: lark.Client = (
             lark.Client.builder()
@@ -977,6 +994,7 @@ class LarkBot:
             )
 
     def do_p2_im_message_receive_v1(self, data: P2ImMessageReceiveV1) -> None:
+
         message = data.event.message
 
         try:
@@ -993,6 +1011,25 @@ class LarkBot:
             )
             return
 
+        # ------------------------------------------------------------------------------
+        # 鉴权
+        # ------------------------------------------------------------------------------
+        try:
+            open_id = data.event.sender.sender_id.open_id
+
+            if open_id not in self.auth.allowed_open_ids:
+                logger.info("unauthorized open_id: %s", open_id)
+                self.send_text_response(message, "Unauthorized open_id. Please contact the administrator.")
+                return
+            
+        except Exception as e:
+            logger.exception("get sender_id failed")
+            self.send_text_response(message, "Getting sender_id failed. Please contact the administrator.")
+            return
+
+        # ------------------------------------------------------------------------------
+        # 处理消息
+        # ------------------------------------------------------------------------------
         if message.message_type != "text":
             self.send_text_response(message, "Only text messages are supported for now.")
             return
@@ -1061,7 +1098,10 @@ def lark_bot() -> None:
             config=config,
         )
 
-        bot = LarkBot(backend)
+        bot = LarkBot(
+            config=config,
+            backend=backend,
+        )
         bot.start()
 
     finally:

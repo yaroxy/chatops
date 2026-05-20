@@ -4,6 +4,9 @@ agent="plan"
 providerID="deepseek"
 modelID="deepseek-v4-pro"
 
+[chatops.auth]
+allowed_open_ids=[""]
+
 [chatops.workspaces.test-chatops]
 path="/mnt/data/cpfs/yafengsun/workspace/test-chatops"
 
