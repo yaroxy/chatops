@@ -10,6 +10,7 @@ import httpx
 import json
 import lark_oapi as lark
 import logging
+import logging.config
 import os
 import re
 import threading
@@ -43,7 +44,7 @@ OPENCODE_SERVER_PASSWORD: str = os.environ.get("OPENCODE_SERVER_PASSWORD", "vibe
 OPENCODE_SERVER_USERNAME: str = os.environ.get("OPENCODE_SERVER_USERNAME", "yaroxy")
 OPENCODE_PORT: int = int(os.environ.get("OPENCODE_PORT", "8192"))
 OPENCODE_HOSTNAME: str = os.environ.get("OPENCODE_HOSTNAME", "127.0.0.1")
-OUTPUTS_DIR: str = os.environ.get("OUTPUTS_DIR", "outputs")
+OUTPUTS_DIR: str = os.environ.get("OUTPUTS_DIR", f"{os.getcwd()}/outputs")
 CONFIG_PATH: str = os.environ.get("CHATOPS_CONFIG", "tests/test.toml")
 
 LARK_APP_ID = os.environ.get("LARK_APP_ID")
@@ -60,14 +61,73 @@ lark.APP_SECRET = LARK_APP_SECRET
 # logging
 # ==============================================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
-)
+# ==============================================================================
+# Logging utils
+# ==============================================================================
+def _get_default_log_file() -> Path:
+    log_file: Path = Path(os.getenv("OUTPUTS_DIR", f"{os.getcwd()}/outputs")) / "logs" / f"{__package__}/{time.strftime('%Y_%m_%d_%H_%M_%S')}.log"
+    return log_file
+
+def _build_logging_config(log_file: Path) -> dict:
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "standard": {
+                "format": "%(asctime)s [%(levelname)s] %(message)s",
+            },
+            "detailed": {
+                "format": (
+                    "%(asctime)s [%(levelname)s] "
+                    "[%(name)s] [%(lineno)d] [%(funcName)s] %(message)s"
+                ),
+            },
+        },
+        "handlers": {
+            "console": {
+                "level": "INFO",
+                "class": "logging.StreamHandler",
+                "formatter": "standard",
+            },
+            "file": {
+                # "level": "DEBUG",
+                "level": "INFO",
+                "class": "logging.handlers.RotatingFileHandler",
+                "filename": str(log_file),
+                "maxBytes": 10 * 1024 * 1024,
+                "backupCount": 5,
+                "formatter": "detailed",
+                "encoding": "utf8",
+            },
+        },
+        "loggers": {
+            "": {
+                "handlers": ["console", "file"],
+                "level": "DEBUG",
+                "propagate": True,
+            },
+            "httpx": {"level": "WARNING"},
+            "urllib3": {"level": "WARNING"},
+        },
+    }
+
+def setup_logging(log_file: Path | None = None) -> Path:
+    """
+    Initialize logging once.
+
+    Returns the actual log file path.
+    """
+    if log_file is None:
+        log_file: Path = _get_default_log_file()
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    logging.config.dictConfig(_build_logging_config(log_file))
+    return log_file
 
 # 避免 Lark SDK 日志被 SDK handler 和 root handler 打印两次
 logging.getLogger("Lark").propagate = False
 
+setup_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -1029,6 +1089,10 @@ def test_opencode_serve_api() -> None:
         print("vcs:", api.vcs())
         print("provider:", api.provider())
 
+"""
+usage:
+    python tests/test_opencode_serve_v2.py
+"""
 
 if __name__ == "__main__":
     # test_config()

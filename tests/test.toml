@@ -5,7 +5,10 @@ providerID="deepseek"
 modelID="deepseek-v4-pro"
 
 [chatops.workspaces.test-chatops]
-path="/Users/roxy/Documents/workspace/test-chatops"
+path="/mnt/data/cpfs/yafengsun/workspace/test-chatops"
 
 [chatops.workspaces.test-chatops-copy]
-path="/Users/roxy/Documents/workspace/test-chatops-copy"
+path="/mnt/data/cpfs/yafengsun/workspace/test-chatops-copy"
+
+[chatops.workspaces.llm-memory]
+path="/mnt/data/cpfs/yafengsun/workspace/llm-memory"
