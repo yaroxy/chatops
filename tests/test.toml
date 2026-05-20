@@ -1,0 +1,11 @@
+[chatops]
+workspace="test-chatops"
+agent="plan"
+providerID="deepseek"
+modelID="deepseek-v4-pro"
+
+[chatops.workspaces.test-chatops]
+path="/Users/roxy/Documents/workspace/test-chatops"
+
+[chatops.workspaces.test-chatops-copy]
+path="/Users/roxy/Documents/workspace/test-chatops-copy"

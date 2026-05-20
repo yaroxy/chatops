@@ -36,13 +36,17 @@ fi
 # ==============================================================================
 OPENCODE_SERVER_PASSWORD=${OPENCODE_SERVER_PASSWORD:-vibe-coding}
 OPENCODE_SERVER_USERNAME=${OPENCODE_SERVER_USERNAME:-yaroxy}
+OPENCODE_SERVER_PORT=${OPENCODE_SERVER_PORT:-8192}
+OPENCODE_SERVER_HOSTNAME=${OPENCODE_SERVER_HOSTNAME:-0.0.0.0}
 
-log_dir="/mnt/data/cpfs/yafengsun/workspace/chatops/outputs/logs"
+OUTPUTS_DIR=${OUTPUTS_DIR:-/Users/roxy/Documents/workspace/chatops/outputs}
+
+log_dir="${OUTPUTS_DIR}/logs/opencode"
 mkdir -p "$log_dir"
 
 opencode serve \
-  --hostname 0.0.0.0 \
-  --port 4096 \
+  --hostname $OPENCODE_SERVER_HOSTNAME \
+  --port $OPENCODE_SERVER_PORT \
   --print-logs \
   --log-level DEBUG \
   2>&1 | tee >(rotatelogs -l ${log_dir}/$(date +%Y-%m-%d-%H-%M-%S).log 5M)

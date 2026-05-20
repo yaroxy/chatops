@@ -1,15 +1,11 @@
 [opencode]
-server_url = "http://127.0.0.1:4096"
-username_env = "OPENCODE_SERVER_USERNAME"
-password_env = "OPENCODE_SERVER_PASSWORD"
 default_workspace = "test-chatops"
 default_agent = "plan"
-default_model = "deepseek/deepseek-v4-pro"
-state_path = ".chatops/opencode-state.json"
-task_timeout_seconds = 1800
+default_providerID = "deepseek"
+default_modelID = "deepseek-v4-pro"
 
 [opencode.workspaces.test-chatops]
-path = "/mnt/data/cpfs/yafengsun/test-chatops"
+path = "/Users/roxy/Documents/workspace/test-chatops"
 
-[opencode.workspaces.llm-memory]
-path = "/mnt/data/cpfs/yafengsun/workspace/llm-memory"
+[opencode.workspaces.test-chatops-copy]
+path = "/Users/roxy/Documents/workspace/test-chatops-copy"
